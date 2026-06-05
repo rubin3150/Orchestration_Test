@@ -1,22 +1,57 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "TestCubeSpawner.h"
+#include "Orchestration.h"
 #include "Engine/StaticMeshActor.h"
 #include "Engine/StaticMesh.h"
 #include "Components/StaticMeshComponent.h"
 #include "Materials/MaterialInstanceDynamic.h"
 #include "UObject/ConstructorHelpers.h"
 
+namespace
+{
+	// Engine built-in assets used to render the test cubes.
+	const TCHAR* const CubeMeshPath = TEXT("/Engine/BasicShapes/Cube.Cube");
+	const TCHAR* const CubeMaterialPath = TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial");
+
+	// Name of the vector parameter on BasicShapeMaterial used to tint each cube.
+	const FName CubeColorParameterName(TEXT("Color"));
+}
+
 ATestCubeSpawner::ATestCubeSpawner()
 {
 	PrimaryActorTick.bCanEverTick = true;
+
+	// Resolve engine built-in assets at construction time instead of blocking the
+	// game thread with a runtime LoadObject.
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> CubeMeshFinder(CubeMeshPath);
+	if (CubeMeshFinder.Succeeded())
+	{
+		CubeMesh = CubeMeshFinder.Object;
+	}
+
+	static ConstructorHelpers::FObjectFinder<UMaterialInterface> CubeMaterialFinder(CubeMaterialPath);
+	if (CubeMaterialFinder.Succeeded())
+	{
+		CubeMaterial = CubeMaterialFinder.Object;
+	}
 }
 
 void ATestCubeSpawner::BeginPlay()
 {
 	Super::BeginPlay();
 
-	SpawnTestCubes();
+	// Only the authority should populate the world to avoid double-spawning on clients.
+	if (HasAuthority())
+	{
+		SpawnTestCubes();
+	}
+
+	// Nothing to animate -> save the per-frame cost.
+	if (SpawnedCubes.Num() == 0)
+	{
+		SetActorTickEnabled(false);
+	}
 }
 
 void ATestCubeSpawner::SpawnTestCubes()
@@ -27,49 +62,61 @@ void ATestCubeSpawner::SpawnTestCubes()
 		return;
 	}
 
-	// 엔진 내장 큐브 메시 로드
-	UStaticMesh* CubeMesh = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Cube.Cube"));
-	UMaterialInterface* CubeMaterial = LoadObject<UMaterialInterface>(nullptr, TEXT("/Engine/BasicShapes/BasicShapeMaterial.BasicShapeMaterial"));
-
 	if (CubeMesh == nullptr)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("TestCubeSpawner: Cube mesh load failed"));
+		UE_LOG(LogOrchestration, Warning, TEXT("TestCubeSpawner: Cube mesh is not available"));
 		return;
 	}
 
-	// 5x5 격자, 200uu 간격으로 25개 스폰
-	for (int32 Row = 0; Row < 5; ++Row)
-	{
-		for (int32 Col = 0; Col < 5; ++Col)
-		{
-			const FVector Location = GetActorLocation() + FVector(Row * 200.0f, Col * 200.0f, 50.0f);
-			const FRotator Rotation = FRotator::ZeroRotator;
+	// Re-entry (PIE re-enter, streaming re-spawn) must not accumulate stale entries.
+	SpawnedCubes.Reset();
+	CubeBaseLocations.Reset();
+	SpawnedCubes.Reserve(GridRows * GridColumns);
+	CubeBaseLocations.Reserve(GridRows * GridColumns);
 
-			AStaticMeshActor* CubeActor = World->SpawnActor<AStaticMeshActor>(AStaticMeshActor::StaticClass(), Location, Rotation);
+	const FVector Origin = GetActorLocation();
+
+	for (int32 Row = 0; Row < GridRows; ++Row)
+	{
+		for (int32 Col = 0; Col < GridColumns; ++Col)
+		{
+			const FVector Location = Origin + FVector(Row * GridSpacing, Col * GridSpacing, SpawnHeight);
+
+			AStaticMeshActor* CubeActor = World->SpawnActor<AStaticMeshActor>(AStaticMeshActor::StaticClass(), Location, FRotator::ZeroRotator);
 			if (CubeActor == nullptr)
 			{
 				continue;
 			}
 
 			UStaticMeshComponent* MeshComp = CubeActor->GetStaticMeshComponent();
+			if (MeshComp == nullptr)
+			{
+				CubeActor->Destroy();
+				continue;
+			}
+
 			MeshComp->SetMobility(EComponentMobility::Movable);
 			MeshComp->SetStaticMesh(CubeMesh);
-			CubeActor->SetActorScale3D(FVector(0.75f, 0.75f, 0.75f));
+			CubeActor->SetActorScale3D(FVector(CubeScale));
 
-			// 행/열 인덱스에 따라 색을 살짝 다르게 줘서 구분이 쉽게
+			// Tint each cube slightly differently so individual cubes are distinguishable.
 			if (CubeMaterial != nullptr)
 			{
 				UMaterialInstanceDynamic* DynMat = UMaterialInstanceDynamic::Create(CubeMaterial, CubeActor);
-				const FLinearColor Color(Row * 0.2f, Col * 0.2f, 0.5f, 1.0f);
-				DynMat->SetVectorParameterValue(TEXT("Color"), Color);
-				MeshComp->SetMaterial(0, DynMat);
+				if (DynMat != nullptr)
+				{
+					const FLinearColor Color(Row * ColorStep, Col * ColorStep, 0.5f, 1.0f);
+					DynMat->SetVectorParameterValue(CubeColorParameterName, Color);
+					MeshComp->SetMaterial(0, DynMat);
+				}
 			}
 
 			SpawnedCubes.Add(CubeActor);
+			CubeBaseLocations.Add(Location);
 		}
 	}
 
-	UE_LOG(LogTemp, Log, TEXT("TestCubeSpawner: spawned %d cubes"), SpawnedCubes.Num());
+	UE_LOG(LogOrchestration, Log, TEXT("TestCubeSpawner: spawned %d cubes"), SpawnedCubes.Num());
 }
 
 void ATestCubeSpawner::Tick(float DeltaTime)
@@ -78,20 +125,21 @@ void ATestCubeSpawner::Tick(float DeltaTime)
 
 	ElapsedTime += DeltaTime;
 
-	// 스폰된 큐브들을 천천히 회전시켜 살아있는지 확인
 	for (int32 i = 0; i < SpawnedCubes.Num(); ++i)
 	{
 		AStaticMeshActor* Cube = SpawnedCubes[i];
-		if (Cube != nullptr)
+		if (Cube == nullptr)
 		{
-			const float Speed = 45.0f + i * 3.0f;
-			Cube->AddActorLocalRotation(FRotator(0.0f, Speed * DeltaTime, 0.0f));
-
-			// 위아래로 둥둥 떠다니게
-			const float Offset = FMath::Sin(ElapsedTime * 2.0f + i * 0.5f) * 20.0f;
-			FVector Loc = Cube->GetActorLocation();
-			Loc.Z = 50.0f + Offset;
-			Cube->SetActorLocation(Loc);
+			continue;
 		}
+
+		const float Speed = RotationBaseSpeed + i * RotationSpeedPerIndex;
+		Cube->AddActorLocalRotation(FRotator(0.0f, Speed * DeltaTime, 0.0f));
+
+		// Bob around the cube's original spawn position so off-origin spawners work.
+		const float Offset = FMath::Sin(ElapsedTime * BobFrequency + i * BobPhasePerIndex) * BobAmplitude;
+		FVector Loc = CubeBaseLocations[i];
+		Loc.Z += Offset;
+		Cube->SetActorLocation(Loc);
 	}
 }
